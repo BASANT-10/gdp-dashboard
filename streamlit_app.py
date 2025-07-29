@@ -1,181 +1,117 @@
-# streamlit_dictionary_classifier.py
-"""
-📊 **Dictionary‑Based Text Classifier (Streamlit)**
-
-An interactive app that lets you:
-1. Upload a CSV file containing free‑text statements.
-2. Edit / extend keyword dictionaries per marketing‑tactic category.
-3. Classify each statement and download the enriched CSV.
-
-Run with:
-```bash
-streamlit run streamlit_dictionary_classifier.py
-```
-"""
-
-from __future__ import annotations
-
-import io
-from pathlib import Path
-from typing import Dict, Set
-
-import pandas as pd
 import streamlit as st
+import pandas as pd
+import re
+import json
+from io import StringIO
 
-# -------------------------------------------------------------------
-# 1. Default keyword dictionaries (editable inside the app)
-# -------------------------------------------------------------------
-DEFAULT_DICTIONARIES: Dict[str, Set[str]] = {
-    "urgency_marketing": {
-        "limited",
-        "limited time",
-        "limited run",
-        "limited edition",
-        "order now",
-        "last chance",
-        "hurry",
-        "while supplies last",
-        "before they're gone",
-        "selling out",
-        "selling fast",
-        "act now",
-        "don't wait",
-        "today only",
-        "expires soon",
-        "final hours",
-        "almost gone",
-    },
-    "exclusive_marketing": {
-        "exclusive",
-        "exclusively",
-        "exclusive offer",
-        "exclusive deal",
-        "members only",
-        "vip",
-        "special access",
-        "invitation only",
-        "premium",
-        "privileged",
-        "limited access",
-        "select customers",
-        "insider",
-        "private sale",
-        "early access",
-    },
-}
+st.set_page_config(page_title="Marketing Keyword Classifier", page_icon="🔍", layout="centered")
 
-# -------------------------------------------------------------------
-# 2. Helper functions
-# -------------------------------------------------------------------
+st.title("🔍 Marketing Keyword Classifier")
+st.markdown(
+    """Upload any CSV containing free‑text statements (e.g. product descriptions, email subject lines, ad copy) and quickly flag phrases that create **urgency** or **exclusivity**.\n\n---"""
+)
 
-def classify_text(text: str, dictionaries: Dict[str, Set[str]]) -> str:
-    """Return a comma‑separated list of tactic labels found in *text*."""
-    if not isinstance(text, str):
-        return ""
+# ---------------------
+# 1) Upload data
+# ---------------------
+uploaded_file = st.file_uploader("📄 Upload CSV", type=["csv"], accept_multiple_files=False)
 
-    text_lc = text.lower()
-    matches = []
-
-    for label, phrases in dictionaries.items():
-        if any(phrase in text_lc for phrase in phrases):  # first hit wins per label
-            matches.append(label)
-
-    return ", ".join(matches)
-
-
-def download_button(df: pd.DataFrame) -> None:
-    """Render a download button for *df* as CSV."""
-    csv_bytes = df.to_csv(index=False).encode("utf-8")
-    st.download_button(
-        "⬇️ Download classified CSV",
-        data=csv_bytes,
-        file_name="classified_data.csv",
-        mime="text/csv",
-    )
-
-
-# -------------------------------------------------------------------
-# 3. Streamlit App
-# -------------------------------------------------------------------
-
-def main() -> None:
-    st.set_page_config(page_title="Dictionary Text Classifier", page_icon="📊", layout="wide")
-    st.title("📊 Dictionary‑Based Text Classifier")
-    st.write(
-        "Upload a CSV, tweak the keyword dictionaries, then classify each statement into one or more marketing‑tactic categories."
-    )
-
-    # ----------------------------------------------------------------
-    # Sidebar: dictionary editor
-    # ----------------------------------------------------------------
-    with st.sidebar:
-        st.header("🛠️ Keyword Dictionaries")
-
-        if "dictionaries" not in st.session_state:
-            # Deep‑copy to avoid mutating defaults across sessions
-            st.session_state["dictionaries"] = {
-                k: set(v) for k, v in DEFAULT_DICTIONARIES.items()
-            }
-
-        dictionaries = st.session_state["dictionaries"]
-
-        for label in list(dictionaries.keys()):
-            phrases_str = ", ".join(sorted(dictionaries[label]))
-            edited = st.text_area(
-                f"Keywords for '{label}' (comma separated)",
-                value=phrases_str,
-                height=80,
-            )
-            dictionaries[label] = {p.strip().lower() for p in edited.split(",") if p.strip()}
-
-        st.divider()
-        st.subheader("Add a new category")
-        new_label = st.text_input("Category label")
-        new_keywords = st.text_input("Keywords (comma separated)")
-        if st.button("Add / Update Category") and new_label:
-            dictionaries[new_label] = {
-                p.strip().lower() for p in new_keywords.split(",") if p.strip()
-            }
-            # Force UI refresh so the new text_area appears
-            st.experimental_rerun()
-
-        if st.button("Reset to Defaults"):
-            st.session_state["dictionaries"] = {
-                k: set(v) for k, v in DEFAULT_DICTIONARIES.items()
-            }
-            st.experimental_rerun()
-
-    # ----------------------------------------------------------------
-    # Main area: file uploader & classification
-    # ----------------------------------------------------------------
-    uploaded_file = st.file_uploader("📄 Upload CSV file", type=["csv"], accept_multiple_files=False)
-
-    if uploaded_file is None:
-        st.info("👆 Upload a CSV file to begin.")
-        st.stop()
-
+df: pd.DataFrame | None = None
+if uploaded_file:
     try:
         df = pd.read_csv(uploaded_file)
-    except Exception as exc:
-        st.error(f"Failed to read CSV: {exc}")
-        st.stop()
+        st.success("Dataset loaded! Preview below ⬇️")
+        st.dataframe(df.head())
+    except Exception as e:
+        st.error(f"❌ Could not read CSV: {e}")
 
-    if df.empty:
-        st.warning("The uploaded file is empty.")
-        st.stop()
+# ---------------------
+# 2) Configure / extend dictionaries
+# ---------------------
+DEFAULT_DICTIONARIES = {
+    "urgency_marketing": [
+        "limited", "limited time", "limited run", "limited edition", "order now",
+        "last chance", "hurry", "while supplies last", "before they're gone",
+        "selling out", "selling fast", "act now", "don't wait", "today only",
+        "expires soon", "final hours", "almost gone"
+    ],
+    "exclusive_marketing": [
+        "exclusive", "exclusively", "exclusive offer", "exclusive deal",
+        "members only", "vip", "special access", "invitation only",
+        "premium", "privileged", "limited access", "select customers",
+        "insider", "private sale", "early access"
+    ],
+}
 
-    # Choose text column
-    text_col = st.selectbox("Select the column containing statements to classify", options=df.columns)
+st.markdown("### 🛠️ Edit keyword dictionaries (JSON)")
 
-    # Classify button
-    if st.button("🚀 Run Classification"):
+with st.expander("Show/Hide dictionaries editor"):
+    json_input = st.text_area(
+        "Each top‑level key is a category; provide a JSON object mapping to **lists** of keywords.",
+        value=json.dumps(DEFAULT_DICTIONARIES, indent=4),
+        height=300,
+    )
+
+# Parse custom dictionaries (fall back to default on error)
+try:
+    dictionaries = json.loads(json_input)
+    if not isinstance(dictionaries, dict):
+        raise ValueError("Top‑level JSON must be an object mapping category ➜ keywords list.")
+    dictionaries = {
+        cat: set(terms) if isinstance(terms, (list, set)) else set()
+        for cat, terms in dictionaries.items()
+    }
+except Exception as e:
+    st.warning(f"⚠️ Invalid JSON provided – using default dictionaries. ({e})")
+    dictionaries = {k: set(v) for k, v in DEFAULT_DICTIONARIES.items()}
+
+# ---------------------
+# 3) Build regex patterns
+# ---------------------
+patterns = {
+    cat: re.compile(r"\\b(?:" + "|".join(map(re.escape, terms)) + r")\\b", flags=re.I)
+    for cat, terms in dictionaries.items()
+}
+
+# ---------------------
+# 4) Classification helper
+# ---------------------
+@st.cache_data(show_spinner=False)
+def classify_series(series: pd.Series) -> pd.Series:
+    def classify(text: str | float):
+        text = text if isinstance(text, str) else ""
+        cats = [cat for cat, pat in patterns.items() if pat.search(text)]
+        return ",".join(cats) if cats else None
+
+    return series.apply(classify)
+
+# ---------------------
+# 5) Choose column + run
+# ---------------------
+if df is not None:
+    with st.form(key="run_form"):
+        text_col = st.selectbox("Select the column containing text to analyze", options=df.columns, index=0)
+        submitted = st.form_submit_button("🚀 Run classification")
+
+    if submitted:
         with st.spinner("Classifying…"):
-            df["Category"] = df[text_col].apply(lambda t: classify_text(t, dictionaries))
-
+            df_result = df.copy()
+            df_result["categories"] = classify_series(df_result[text_col])
         st.success("Done!")
-        st.dataframe(df, use_container_width=True)
-        download_button(df)
+        st.dataframe(df_result)
 
+        # Offer download
+        csv_bytes = df_result.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "⬇️ Download results as CSV",
+            data=csv_bytes,
+            file_name="classified_data.csv",
+            mime="text/csv",
+        )
 
-if __name__ == "__main__":
-    main()
+# ---------------------
+# Footer
+# ---------------------
+st.markdown("---")
+st.caption("Built with ❤️ using Streamlit.")
+
